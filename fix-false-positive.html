@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DEPT false positive: RCU dept key collision (fd560f665f3e)</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161a21; --panel2:#1c2230; --fg:#e6e9ef; --dim:#9aa4b2;
+    --acc:#6aa9ff; --good:#5ad18a; --bad:#ff6b6b; --warn:#ffcc66; --line:#2a3140;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 96px}
+  h1{font-size:1.9rem;line-height:1.25;margin:0 0 6px}
+  h2{font-size:1.35rem;margin:44px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+  h3{font-size:1.08rem;margin:26px 0 8px;color:#cfd8e6}
+  p,li{color:#dde3ec}
+  code,pre,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+  code{background:#1b2130;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:.9em}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;
+      overflow-x:auto;font-size:.86rem;line-height:1.45}
+  pre.diagram{background:#12161d;color:#d7e2f2}
+  .sub{color:var(--dim);margin:0 0 22px}
+  .box{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--acc);
+       border-radius:8px;padding:14px 18px;margin:18px 0}
+  .box.bad{border-left-color:var(--bad)}
+  .box.good{border-left-color:var(--good)}
+  .box.warn{border-left-color:var(--warn)}
+  .box h4{margin:0 0 8px;font-size:1rem;letter-spacing:.02em;text-transform:uppercase;color:var(--dim)}
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:.92rem}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#cfd8e6}
+  td code{white-space:nowrap}
+  .tag{display:inline-block;font-size:.72rem;padding:2px 8px;border-radius:999px;
+       border:1px solid var(--line);background:#1b2130;color:var(--dim);margin-right:6px}
+  .S{color:var(--warn);font-weight:700}
+  .W{color:var(--bad);font-weight:700}
+  .E{color:var(--good);font-weight:700}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:820px){.grid2{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .card h4{margin:0 0 8px;font-size:.95rem;color:#cfd8e6}
+  ol.steps>li{margin-bottom:12px}
+  .kv{color:var(--dim)}
+  a{color:var(--acc)}
+  /* Hash references (commits, syzbot IDs): keep the code look, mark the link with a dotted rule. */
+  a.commit,a.ref{color:inherit;text-decoration:none;border-bottom:1px dashed var(--acc)}
+  a.commit:hover,a.ref:hover{border-bottom-style:solid;color:var(--acc)}
+  /* deadlock emphasis */
+  .dl{color:#ff8b8b;font-weight:700;background:#2a1b1e;border:1px solid var(--bad);
+      border-radius:4px;padding:0 6px}
+  hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  .foot{color:var(--dim);font-size:.86rem}
+  .mermaid{background:#12161d;border:1px solid var(--line);border-radius:8px;
+           padding:16px 12px;margin:18px 0 6px;text-align:center;overflow-x:auto}
+  .figcap{color:var(--dim);font-size:.84rem;margin:0 0 22px;text-align:center}
+  .mermaid:not([data-processed])::before{content:"(mermaid diagram needs network for the CDN)";
+           color:var(--dim);font-size:.8rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>A DEPT false positive, and how it was fixed<br><span style="font-size:.62em;color:var(--dim)">
+commit <code><a class="commit" href="https://github.com/yskzalloc/linux-dept/commit/fd560f665f3e" title="rcu/update: fix same dept key collision between various types of RCU, DEPT branch dept19.1_v7.2, not in mainline">fd560f665f3e</a></code> "rcu/update: fix same dept key collision between various types of RCU"</span></h1>
+<p class="sub">Written for someone who has just enabled <code>CONFIG_DEPT</code> and got a scary report.
+Everything below is taken from this tree (branch <code><a class="commit" href="https://github.com/yskzalloc/linux-dept/tree/dept19_v7.2" title="DEPT branch dept19.1_v7.2">dept19.1_v7.2</a></code>).</p>
+
+<div class="box">
+<h4>TL;DR</h4>
+<p>DEPT reported a circular dependency between <code>cpu_hotplug_lock</code> and “an RCU
+grace-period wait”. It was <b>not real</b>. Two <em>different</em> waits, a
+<code>synchronize_rcu()</code> and a <code>synchronize_rcu_tasks_trace()</code> were being filed under
+<b>one DEPT class</b>, because both of them block inside the same function
+(<code>__wait_rcu_gp()</code>) and DEPT derived the class from that single code location.
+Merging two unrelated wait channels into one class merged their dependencies too, which
+closed a cycle that cannot happen in reality.</p>
+<p>The fix does not touch any locking. It gives each <code>_wait_rcu_gp()</code>
+<b>expansion site</b> its own <code>struct dept_key</code>, hands it down to
+<code>__wait_rcu_gp()</code>, and attaches it to each <code>struct rcu_synchronize</code>’s
+completion with the new <code>init_completion_dmap()</code> API. Normal RCU and tasks-trace RCU
+then live in separate classes and the fake cycle disappears.</p>
+</div>
+
+<h2>1. DEPT in 90 seconds</h2>
+
+<p>Lockdep tracks <em>lock acquisition order</em>. DEPT tracks <em>wait → event</em> order, so it
+can also reason about things that are not locks: folio locks, completions, waitqueues,
+DMA fences, grace periods. Its whole model is three markers, which is exactly what a report
+prints:</p>
+
+<table>
+<tr><th>Marker</th><th>Meaning</th><th>Typical source</th></tr>
+<tr><td><span class="S">[S]</span></td><td><b>S</b>tart of the event context, the point after which this context is
+    responsible for producing an event (e.g. it just took a lock, so it now owes an unlock)</td>
+    <td><code>mutex_lock()</code>, <code>dept_ecxt_enter()</code></td></tr>
+<tr><td><span class="W">[W]</span></td><td>The <b>W</b>ait that blocked, inside that event context</td>
+    <td><code>folio_wait_bit_common()</code>, <code>wait_for_completion*()</code></td></tr>
+<tr><td><span class="E">[E]</span></td><td>The <b>E</b>vent that is therefore not reachable while the wait is stuck</td>
+    <td><code>mutex_unlock()</code>, <code>complete()</code>/<code>try_to_wake_up()</code></td></tr>
+</table>
+
+<p>One line of a report reads <code>lock(&amp;ni-&gt;ni_lock:0)</code> or
+<code>__wait_rcu_gp(&lt;sched&gt;:0)</code>. The parenthesis is the <b>class</b> and the number after
+<code>:</code> is the subclass. Three objects matter, and confusing them is the single most common
+reason a beginner cannot tell a false positive from a real bug:</p>
+
+<table>
+<tr><th>Object</th><th>What it is</th><th>Where</th></tr>
+<tr><td><code>struct dept_key</code></td><td><b>Class identity.</b> Two waits with the same key are the
+   same class, i.e. DEPT believes they are the same synchronization channel.</td>
+   <td><code>include/linux/dept.h</code></td></tr>
+<tr><td><code>struct dept_map</code></td><td><b>Instance state</b> (name, subclass, <code>wgen</code> timestamp)
+   pointing at a key. Many maps may share one key.</td>
+   <td><code>include/linux/dept.h</code></td></tr>
+<tr><td>dependency graph</td><td>Edges between <i>classes</i>, accumulated over the whole boot.
+   A cycle here is what gets reported.</td>
+   <td><code>kernel/dependency/dept.c</code>, <code>/proc/dept_deps</code></td></tr>
+</table>
+
+<div class="box warn">
+<h4>The one rule to remember</h4>
+<p>DEPT only ever compares <b>classes</b>. If you give two unrelated waits the same key, DEPT
+will happily combine a dependency observed on one with a dependency observed on the other.
+<b>Key granularity is the correctness knob for false positives.</b></p>
+</div>
+
+<h2>2. How a <code>wait_for_completion()</code> gets its class</h2>
+
+<p>This is the mechanism the bug lives in. In this tree <code>struct completion</code> holds a
+<em>pointer</em> to an optional map (<code>include/linux/completion.h</code>):</p>
+
+<pre>struct completion {
+	unsigned int done;
+	struct swait_queue_head wait;
+	struct dept_map *dmap;          /* NULL by default */
+};
+
+#define init_completion(x) init_completion_dmap(x, NULL)
+
+#define wait_for_completion_state(x, s)					\
+({									\
+	int __ret;							\
+	sdt_might_sleep_start_timeout((x)-&gt;dmap, -1L);			\
+	__ret = __wait_for_completion_state(x, s);			\
+	sdt_might_sleep_end();						\
+	__ret;								\
+})</pre>
+
+<p>and <code>include/linux/dept_sdt.h</code> decides the key:</p>
+
+<pre>#define sdt_might_sleep_start_timeout(m, t)				\
+	do {								\
+		struct dept_map *__m = m;				\
+		<b>static struct dept_key __key;</b>				\
+		dept_stage_wait(__m, <b>__m ? NULL : &amp;__key</b>, _THIS_IP_, __func__, t);\
+	} while (0)</pre>
+
+<ul>
+<li><b>No map</b> (<code>x-&gt;dmap == NULL</code>): the class is that <code>static __key</code>
+    one key per <em>place in the code where the wait happens</em>. The report prints the class as
+    <code>&lt;sched&gt;</code> because the wait was staged for the scheduler
+    (<code>dt-&gt;stage_sched_map = true</code> in <code>dept_stage_wait()</code>).</li>
+<li><b>With a map</b>: the map’s key wins, so the caller chooses the granularity.</li>
+</ul>
+
+<p>The matching <em>event</em> is not annotated in <code>complete()</code> at all. DEPT discovers it in
+<code>try_to_wake_up()</code>:</p>
+
+<pre class="diagram">waiter task                                     waker task
+-----------                                     ----------
+wait_for_completion_state(&amp;rs-&gt;completion)
+  sdt_might_sleep_start_timeout(dmap, -1)
+    dept_stage_wait(m, k, ...)   ── stages the class on the task
+  __wait_for_completion_state()
+    schedule()                                  complete(&amp;rs-&gt;completion)
+      dept_request_event_wait_commit()            swake_up...  -&gt; try_to_wake_up(p)
+      (the wait becomes real)                        <b>dept_ttwu_stage_wait(p, ip)</b>
+                                                       __dept_event(p's staged map,
+                                                                    "try_to_wake_up")</pre>
+
+<p>So <b>whoever wakes the sleeper is retroactively credited as the producer of that class’s
+event</b>. That is why the report says <code>[E] try_to_wake_up(&lt;sched&gt;:0)</code> and prints an
+extra “(wait to wake up)” stack: the stack of the task that was waiting.</p>
+
+<h2>3. The report, annotated</h2>
+
+<pre><span class="dl">*** DEADLOCK ***</span>
+
+context A
+   <span class="S">[S]</span> lock(cpu_hotplug_lock:0)          &lt;- cgroup_procs_write_start() did cpus_read_lock()
+   <span class="W">[W]</span> __wait_rcu_gp(&lt;sched&gt;:0)         &lt;- synchronize_rcu() blocks here
+   <span class="E">[E]</span> unlock(cpu_hotplug_lock:0)       &lt;- therefore unreachable while blocked
+
+context B
+   <span class="S">[S]</span> (unknown)(&lt;sched&gt;:0)             &lt;- some context that owes a &lt;sched&gt; wake-up
+   <span class="W">[W]</span> lock(cpu_hotplug_lock:0)         &lt;- check_all_holdout_tasks_trace() does cpus_read_lock()
+   <span class="E">[E]</span> try_to_wake_up(&lt;sched&gt;:0)        &lt;- therefore the wake-up is unreachable</pre>
+
+<p>Read from the stacks in the full report:</p>
+
+<pre class="diagram">context A (a cgroup write, PID 3416-ish path)      context B (rcu_tasks kthread)
+-------------------------------------------       -----------------------------------------
+cgroup_file_write                                  rcu_tasks_kthread
+  cgroup_procs_write_start
+    <b>cpus_read_lock</b>                    [S]        rcu_tasks_one_gp
+    percpu_down_write                                rcu_tasks_wait_gp
+      rcu_sync_enter                                   check_all_holdout_tasks_trace
+        <b>synchronize_rcu</b>                                <b>cpus_read_lock</b>              [W]
+          synchronize_rcu_normal
+            _wait_rcu_gp
+              __wait_rcu_gp                            rcu_tasks_invoke_cbs
+                wait_for_completion_state [W]             wakeme_after_rcu
+                                                            complete
+                                                              <b>try_to_wake_up</b>          [E]
+    cpus_read_unlock                    [E]</pre>
+
+<p>DEPT's conclusion: "A holds <code>cpu_hotplug_lock</code> and waits for a
+<code>&lt;sched&gt;</code> wake-up; the context that must deliver that
+<code>&lt;sched&gt;</code> wake-up waits for <code>cpu_hotplug_lock</code>" a cycle.</p>
+
+<div class="mermaid">
+flowchart TD
+    subgraph A["Context A: cgroup write"]
+        direction TB
+        AS["[S] lock cpu_hotplug_lock"]
+        AW["[W] __wait_rcu_gp class sched"]
+        AE["[E] unlock cpu_hotplug_lock"]
+        AS --> AW --> AE
+    end
+
+    subgraph B["Context B: rcu_tasks kthread"]
+        direction TB
+        BS["[S] owes a sched wake-up"]
+        BW["[W] lock cpu_hotplug_lock"]
+        BE["[E] try_to_wake_up class sched"]
+        BS --> BW --> BE
+    end
+
+    AW -. "needs sched [E]" .-> BE
+    BW -. "needs cpu_hotplug_lock [E]" .-> AE
+</div>
+<p class="figcap">What DEPT claims: <code>cpu_hotplug_lock → &lt;sched&gt; → cpu_hotplug_lock</code>
+(the class is printed as <code>&lt;sched&gt;</code>; angle brackets are dropped in the diagram
+labels). The flaw is in that single <code>&lt;sched&gt;</code> node, not in the reasoning.</p>
+
+<h2>4. Why it is a false positive</h2>
+
+<p>The two <code>&lt;sched&gt;</code> occurrences are <b>not the same channel</b>. Both call chains
+funnel into the very same function, and that function is where the
+<code>static struct dept_key __key</code> lived:</p>
+
+<pre class="diagram">   synchronize_rcu()                       synchronize_rcu_tasks_trace()
+     synchronize_rcu_normal()                synchronize_rcu_tasks_generic()
+       _wait_rcu_gp(...)                       wait_rcu_gp_state(...) -&gt; _wait_rcu_gp(...)
+          \                                       /
+           \_____________  __wait_rcu_gp()  ______/
+                                 |
+                    wait_for_completion_state(&amp;rs_array[i].completion, state)
+                                 |
+                     sdt_might_sleep_start_timeout(NULL, -1L)
+                                 |
+                     <b>one static __key  ==  ONE DEPT CLASS  ==  "&lt;sched&gt;"</b></pre>
+
+<div class="mermaid">
+flowchart TD
+    SR["synchronize_rcu()"] --> SRN["synchronize_rcu_normal()"]
+    ST["synchronize_rcu_tasks_trace()"] --> STG["synchronize_rcu_tasks_generic()"]
+    SRN --> WG["_wait_rcu_gp()"]
+    STG --> WG
+    WG --> WRG["__wait_rcu_gp()"]
+    WRG --> WFC["wait_for_completion_state()"]
+    WFC --> K["static dept_key inside __wait_rcu_gp ONE class"]
+    K --> C1["edge recorded: cpu_hotplug_lock to this class"]
+    K --> C2["edge recorded: this class to cpu_hotplug_lock"]
+    C1 --> CYC["cycle reported"]
+    C2 --> CYC
+</div>
+<p class="figcap">Before: every RCU flavour funnels through one wait callsite, so unrelated edges
+land on one graph node and close a loop.</p>
+
+<div class="mermaid">
+flowchart TD
+    SR["synchronize_rcu()"] --> SRN["synchronize_rcu_normal()"]
+    ST["synchronize_rcu_tasks_trace()"] --> STG["synchronize_rcu_tasks_generic()"]
+    SRN --> K1["_wait_rcu_gp() expansion static dept_key 1"]
+    STG --> K2["_wait_rcu_gp() expansion static dept_key 2"]
+    K1 --> M1["rcu_synchronize.dmap class: normal RCU GP"]
+    K2 --> M2["rcu_synchronize.dmap class: tasks RCU GP"]
+    M1 --> E1["edge: cpu_hotplug_lock to class 1"]
+    M2 --> E2["edge: class 2 to cpu_hotplug_lock"]
+    E1 --> NO["no cycle"]
+    E2 --> NO
+</div>
+<p class="figcap">After <code><a class="commit" href="https://github.com/yskzalloc/linux-dept/commit/fd560f665f3e" title="rcu/update: fix same dept key collision between various types of RCU, DEPT branch dept19.1_v7.2, not in mainline">fd560f665f3e</a></code>: the key is created per macro expansion site and
+carried into each <code>rcu_synchronize</code>’s map, so the two flavours are different classes.</p>
+
+<div class="grid2">
+<div class="card">
+<h4>Before one class, fake cycle</h4>
+<pre class="diagram">        cpu_hotplug_lock
+            ^        |
+   waits    |        |  waits
+   (tasks-  |        v  (normal RCU GP)
+   trace    |   &lt;sched&gt;:0
+   kthread) |   [merged class]
+            +--------+
+        CYCLE  =&gt;  reported
+
+edges actually observed:
+  cpu_hotplug_lock -&gt; &lt;sched&gt;   (from synchronize_rcu, ctx A)
+  &lt;sched&gt; -&gt; cpu_hotplug_lock   (from rcu_tasks kthread, ctx B)
+different channels, same node.</pre>
+</div>
+<div class="card">
+<h4>After two classes, no cycle</h4>
+<pre class="diagram">        cpu_hotplug_lock
+            |              ^
+     waits  |              | waits
+            v              |
+    &lt;rcu-normal GP&gt;   &lt;rcu-tasks GP&gt;
+       class K1            class K2
+
+  cpu_hotplug_lock -&gt; K1
+  K2 -&gt; cpu_hotplug_lock
+  NO cycle  =&gt; silent</pre>
+</div>
+</div>
+
+<p>Why is the merge wrong even though both really are “wait for a grace period”?</p>
+<ul>
+<li>They are woken by different machinery: normal RCU’s callback path vs. the
+    <code>rcu_tasks</code> kthread. Blocking one never blocks the other.</li>
+<li>The <code>rcu_synchronize</code> objects are distinct on-stack objects, and the tasks-trace wait
+    in the report belongs to a <b>boot-time initcall</b>
+    (<code>rcu_init_tasks_generic()</code>), which cannot be in a cycle with a running cgroup write.</li>
+<li>Both <code>cpu_hotplug_lock</code> takers in the report are <em>readers</em>
+    (<code>cpus_read_lock()</code>); the “A→B” edge in context A only exists because
+    <code>percpu_down_write()</code> comes later. Even ignoring that, the cycle needs the two
+    <code>&lt;sched&gt;</code> nodes to be one node and they are not.</li>
+</ul>
+
+<h2>5. The fix</h2>
+
+<p><code>git show fd560f665f3e</code> 3 files, 12 insertions, 7 deletions. No locking change.</p>
+
+<h3>5.1 Give every <code>_wait_rcu_gp()</code> expansion its own key</h3>
+<pre>--- a/include/linux/rcupdate_wait.h
++++ b/include/linux/rcupdate_wait.h
+ struct rcu_synchronize {
+ 	struct rcu_head head;
+ 	struct completion completion;
+ 	struct rcu_gp_oldstate oldstate;
++	struct dept_map dmap;
++	struct dept_key dkey;
+ };
+
+ void __wait_rcu_gp(bool checktiny, unsigned int state, int n, call_rcu_func_t *crcu_array,
+-		   struct rcu_synchronize *rs_array);
++		   struct rcu_synchronize *rs_array, <b>struct dept_key *dkey</b>);
+
+ #define _wait_rcu_gp(checktiny, state, ...)					\
+ do {										\
+ 	call_rcu_func_t __crcu_array[] = { __VA_ARGS__ };			\
++	<b>static struct dept_key __key;</b>						\
+ 	struct rcu_synchronize __rs_array[ARRAY_SIZE(__crcu_array)];		\
+-	__wait_rcu_gp(checktiny, state, ARRAY_SIZE(__crcu_array), __crcu_array, __rs_array);
++	__wait_rcu_gp(checktiny, state, ARRAY_SIZE(__crcu_array), __crcu_array, __rs_array, <b>&amp;__key</b>);
+ } while (0)</pre>
+
+<p><code>_wait_rcu_gp()</code> is a <em>macro</em>, so <code>static struct dept_key __key</code> is
+instantiated once <b>per expansion site</b> one in <code>synchronize_rcu_normal()</code>
+(<code>kernel/rcu/tree.c:3314</code>, via <code>wait_rcu_gp()</code>), one in
+<code>synchronize_rcu_tasks_generic()</code> (<code>kernel/rcu/tasks.h:672</code>, via
+<code>wait_rcu_gp_state()</code>), one per <code>synchronize_rcu_mult()</code> user, and so on.
+That is the granularity that was missing: previously the only static existed inside the
+<em>callee</em>.</p>
+
+<h3>5.2 Attach the key to each wait through a real map</h3>
+<pre>--- a/kernel/rcu/update.c
++++ b/kernel/rcu/update.c
+ 		if (j == i) {
+ 			init_rcu_head_on_stack(&amp;rs_array[i].head);
+-			init_completion(&amp;rs_array[i].completion);
++			<b>sdt_map_init_key(&amp;rs_array[i].dmap, dkey);</b>
++			<b>init_completion_dmap(&amp;rs_array[i].completion, &amp;rs_array[i].dmap);</b>
+ 			(crcu_array[i])(&amp;rs_array[i].head, wakeme_after_rcu);
+ 		}</pre>
+<pre>--- a/kernel/rcu/rcu.h        +#include &lt;linux/dept_sdt.h&gt;</pre>
+
+<p>Now <code>wait_for_completion_state()</code> sees a non-NULL <code>-&gt;dmap</code>, so
+<code>sdt_might_sleep_start_timeout()</code> stages <em>that</em> map, and
+<code>dept_stage_wait()</code>/<code>dept_map_reinit()</code> keep the map’s key
+(<code>dept_map_reinit()</code> only replaces <code>-&gt;keys</code> when a key is passed, and here
+<code>k == NULL</code> because <code>m != NULL</code>). Result: per-flavour class, per-object map.</p>
+
+<h3>5.3 Why not simply let each <code>rcu_synchronize</code> have its own class?</h3>
+<p><code>dept_map_init(m, NULL, ...)</code> would use <code>&amp;m-&gt;map_key</code>, i.e. a class per
+object. Every <code>synchronize_rcu()</code> allocates <code>rs_array[]</code> <b>on the stack</b>, so
+each call would create a brand-new class, no dependency would ever accumulate across calls,
+and DEPT would go blind on RCU. The right granularity for a synchronization <em>channel</em> is
+per-callsite (shared across invocations), which is what the patch does.</p>
+
+<div class="box warn">
+<h4>Two honest caveats about this patch (verified in the tree)</h4>
+<ul>
+<li><code>rcu_tasks</code>, <code>rcu_tasks_rude</code> and <code>rcu_tasks_trace</code> all reach
+<code>wait_rcu_gp_state()</code> through the single expansion in
+<code>synchronize_rcu_tasks_generic()</code> (<code>kernel/rcu/tasks.h:672</code>), so those three
+flavours still share one key. The reported collision (normal RCU vs. tasks-trace RCU) is gone;
+a collision among the tasks flavours is still possible and would need the key to be pushed into
+<code>struct rcu_tasks</code>.</li>
+<li>The new <code>struct rcu_synchronize::dkey</code> field has no user:
+<code>grep -rn '\.dkey\|-&gt;dkey' kernel/ include/</code> only matches lockdep’s own
+<code>lock_class_key::dkey</code>. The class comes from the caller-site key, not from this field.</li>
+</ul>
+</div>
+
+<h2>6. The general process for fixing a DEPT false positive</h2>
+
+<p>Nothing below is RCU-specific; this is the routine to follow for any report. DEPT’s Kconfig
+help says it plainly: <em>“This feature is considered EXPERIMENTAL that might produce false
+positive reports because new dependencies start to be tracked, that have never been tracked
+before.”</em> Multiple reports are allowed, so a false positive does not silence the tool.</p>
+
+<ol class="steps">
+<li><b>Read only the summary first.</b> Write the two (or more) contexts down as
+<code>[S] / [W] / [E]</code> triples. Each context yields one edge:
+“while inside the event context of class X, we waited for class Y” ⇒ edge <code>X → Y</code>.
+A report is just a cycle over those edges.</li>
+
+<li><b>Identify each class’s <em>origin</em>.</b> This is the decisive step.
+<pre class="diagram">class printed as          means                                    key comes from
+------------------------  --------------------------------------   -----------------------------
+&amp;foo-&gt;bar:0               a named map (lock or explicit dept_map)  that lock/map's key
+&lt;sched&gt;:0                 a schedule()-based wait with NO map      static key at the WAIT callsite
+(unknown)(...)            event context start not recorded         n/a  (N/A stack)</pre>
+<code>&lt;sched&gt;</code> and “(unknown)” are the smell of a coarse class. Find the wait callsite from
+the <code>[W]</code> stack, open that function, and ask: <b>do semantically different wait channels
+pass through this exact line?</b> If yes, you have a key collision, the case fixed by
+<code><a class="commit" href="https://github.com/yskzalloc/linux-dept/commit/fd560f665f3e" title="rcu/update: fix same dept key collision between various types of RCU, DEPT branch dept19.1_v7.2, not in mainline">fd560f665f3e</a></code>.</li>
+
+<li><b>Prove the two contexts can actually coexist.</b> Check for: boot-time-only code
+(initcalls), single-threaded phases, one-shot objects, readers vs. writers of the same rwsem,
+and timeout waits (a wait with a timeout cannot deadlock forever that is why DEPT ignores them
+unless <code>CONFIG_DEPT_AGGRESSIVE_TIMEOUT_WAIT=y</code>). If they cannot coexist, the cycle is
+theoretical.</li>
+
+<li><b>Confirm with the graph, not with intuition.</b>
+<pre>grep -i dept /proc/dept_stats        # objects in use, reports so far
+cat /proc/dept_deps                  # every class-to-class edge DEPT has recorded</pre>
+Look for the suspect class appearing with edges from unrelated subsystems that is a merged
+class in plain sight.</li>
+
+<li><b>Choose the smallest correct fix</b> using this decision tree:
+<pre class="diagram">Is the reported cycle physically possible?
+├─ YES  -&gt; it is a real bug. Fix the code, not the annotation.
+└─ NO
+   ├─ Do unrelated waits share one class?
+   │    ├─ same callsite, different channels
+   │    │     -&gt; move the key OUT to where the channels differ
+   │    │        (macro-level `static struct dept_key`, or a key
+   │    │         field in the per-channel struct) and pass it down.
+   │    │        APIs: sdt_map_init_key(map, key)
+   │    │              init_completion_dmap(completion, map)
+   │    └─ same channel, but instances must not be conflated
+   │          -&gt; use a subclass: dept_map_init(m, k, sub_u, n)
+   │             (sub_u &lt; DEPT_MAX_SUBCLASSES_USR)
+   ├─ Is the wait/event annotation itself wrong or too strong?
+   │    -&gt; fix the annotation site (e.g. weaker/narrower
+   │       sdt_might_sleep_* scope; cf. "cpu/hotplug: use a weaker
+   │       annotation in AP thread" in this tree)
+   └─ Is the object genuinely un-analysable?
+        -&gt; last resort: make the map nocheck (lockdep's
+           no-validate key), and say why in the changelog.</pre></li>
+
+<li><b>Verify.</b> Rebuild with <code>CONFIG_DEPT=y</code>, boot, re-run the reproducer, and check
+two things: the report is gone, <em>and</em> DEPT still reports the deadlocks you expect. This
+branch ships <code>CONFIG_DEPT_UNIT_TEST</code>
+(<code>kernel/dependency/dept_unit_test.c</code>) for the second half; the
+<code>lkdtm</code> folio-lock deadlock scenarios live on the side branch
+<code>b4/dept19.1_v7.2/rdtm</code>. Losing detection while silencing noise is the classic
+regression in the hugetlb thread quoted in the companion document, the DEPT author found that
+his own false-positive suppression (<code>tc-&gt;reported</code> in <code>print_circle()</code>) had
+also suppressed a genuine report.</li>
+
+<li><b>Write the changelog like the commit you are reading.</b> State the two call chains that
+collided, paste the report, and say which key/map granularity you changed. That is what makes a
+DEPT patch reviewable.</li>
+</ol>
+
+<h3>API cheat sheet (this tree)</h3>
+<table>
+<tr><th>API</th><th>Effect on class granularity</th></tr>
+<tr><td><code>sdt_map_init(m)</code></td><td>Static key at <em>this</em> code location; all instances
+initialized here share one class.</td></tr>
+<tr><td><code>sdt_map_init_key(m, k)</code></td><td>Caller supplies the key ⇒ caller controls
+granularity. Used by the RCU fix.</td></tr>
+<tr><td><code>dept_map_init(m, NULL, sub_u, n)</code></td><td>Per-instance class
+(<code>&amp;m-&gt;map_key</code>). Beware: short-lived objects then never accumulate dependencies.</td></tr>
+<tr><td><code>init_completion_dmap(x, m)</code></td><td>Attach an explicit map to a completion;
+otherwise the class is the <code>wait_for_completion*()</code> callsite.</td></tr>
+<tr><td><code>sdt_might_sleep_start[_timeout](m, t)</code> / <code>sdt_might_sleep_end()</code></td>
+<td>Marks a “might block in schedule()” region; with <code>m == NULL</code> the callsite key is used.</td></tr>
+<tr><td><code>sdt_wait(m)</code> / <code>sdt_event(m)</code> / <code>sdt_ecxt_enter/exit(m)</code></td>
+<td>Explicit wait/event annotation for custom primitives.</td></tr>
+<tr><td><code>CONFIG_DEPT_AGGRESSIVE_TIMEOUT_WAIT</code></td><td>Off by default: timeout waits are not
+tracked, since they cannot deadlock forever.</td></tr>
+</table>
+
+<hr>
+
+<h3 id="references">References</h3>
+
+<ul>
+  <li>
+    <strong>DEPT v19 on LKML</strong>
+    <ul>
+      <li>
+        <a href="https://lore.kernel.org/all/20260706061928.66713-1-byungchul@sk.com/"
+           target="_blank" rel="noopener noreferrer">
+          DEPT v19 patch series
+        </a>
+      </li>
+    </ul>
+  </li>
+
+  <li>
+    <strong>DEPT v19.2 Github branch</strong>
+    <ul>
+      <li>
+        <a hrief="https://github.com/yskzalloc/linux-dept"
+           target="_blank" rel="noopener noreferrer">
+          DEPT v19.2 on v7.2 branch
+        </a>
+      </li>
+    </ul>
+  </li>
+</ul>
+
+</div>
+
+<!-- Mermaid renderer. Swap the URL for a vendored copy if you need this file to work offline. -->
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({
+    startOnLoad: true,
+    securityLevel: 'strict',
+    theme: 'base',
+    flowchart: { curve: 'basis', useMaxWidth: true },
+    themeVariables: {
+      darkMode: true,
+      background: '#12161d',
+      primaryColor: '#1c2230',
+      primaryTextColor: '#e6e9ef',
+      primaryBorderColor: '#3a4356',
+      lineColor: '#6aa9ff',
+      textColor: '#dde3ec',
+      clusterBkg: '#161a21',
+      clusterBorder: '#2a3140',
+      edgeLabelBackground: '#12161d',
+      fontSize: '14px'
+    }
+  });
+</script>
+</body>
+</html>
