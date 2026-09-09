@@ -70,8 +70,8 @@ Everything below is taken from this tree (branch <code><a class="commit" href="h
 
 <div class="box">
 <h4>TL;DR</h4>
-<p>DEPT reported a circular dependency between <code>cpu_hotplug_lock</code> and “an RCU
-grace-period wait”. It was <b>not real</b>. Two <em>different</em> waits, a
+<p>DEPT reported a circular dependency between <code>cpu_hotplug_lock</code> and "an RCU
+grace-period wait". It was <b>not real</b>. Two <em>different</em> waits, a
 <code>synchronize_rcu()</code> and a <code>synchronize_rcu_tasks_trace()</code> were being filed under
 <b>one DEPT class</b>, because both of them block inside the same function
 (<code>__wait_rcu_gp()</code>) and DEPT derived the class from that single code location.
@@ -183,7 +183,7 @@ wait_for_completion_state(&amp;rs-&gt;completion)
 
 <p>So <b>whoever wakes the sleeper is retroactively credited as the producer of that class’s
 event</b>. That is why the report says <code>[E] try_to_wake_up(&lt;sched&gt;:0)</code> and prints an
-extra “(wait to wake up)” stack: the stack of the task that was waiting.</p>
+extra "(wait to wake up)" stack: the stack of the task that was waiting.</p>
 
 <h2>3. The report, annotated</h2>
 
@@ -329,7 +329,7 @@ different channels, same node.</pre>
 </div>
 </div>
 
-<p>Why is the merge wrong even though both really are “wait for a grace period”?</p>
+<p>Why is the merge wrong even though both really are "wait for a grace period"?</p>
 <ul>
 <li>They are woken by different machinery: normal RCU’s callback path vs. the
     <code>rcu_tasks</code> kthread. Blocking one never blocks the other.</li>
@@ -337,7 +337,7 @@ different channels, same node.</pre>
     in the report belongs to a <b>boot-time initcall</b>
     (<code>rcu_init_tasks_generic()</code>), which cannot be in a cycle with a running cgroup write.</li>
 <li>Both <code>cpu_hotplug_lock</code> takers in the report are <em>readers</em>
-    (<code>cpus_read_lock()</code>); the “A→B” edge in context A only exists because
+    (<code>cpus_read_lock()</code>); the "A→B" edge in context A only exists because
     <code>percpu_down_write()</code> comes later. Even ignoring that, the cycle needs the two
     <code>&lt;sched&gt;</code> nodes to be one node and they are not.</li>
 </ul>
@@ -421,14 +421,14 @@ a collision among the tasks flavours is still possible and would need the key to
 <h2>6. The general process for fixing a DEPT false positive</h2>
 
 <p>Nothing below is RCU-specific; this is the routine to follow for any report. DEPT’s Kconfig
-help says it plainly: <em>“This feature is considered EXPERIMENTAL that might produce false
+help says it plainly: <em>"This feature is considered EXPERIMENTAL that might produce false
 positive reports because new dependencies start to be tracked, that have never been tracked
-before.”</em> Multiple reports are allowed, so a false positive does not silence the tool.</p>
+before."</em> Multiple reports are allowed, so a false positive does not silence the tool.</p>
 
 <ol class="steps">
 <li><b>Read only the summary first.</b> Write the two (or more) contexts down as
 <code>[S] / [W] / [E]</code> triples. Each context yields one edge:
-“while inside the event context of class X, we waited for class Y” ⇒ edge <code>X → Y</code>.
+"while inside the event context of class X, we waited for class Y" ⇒ edge <code>X → Y</code>.
 A report is just a cycle over those edges.</li>
 
 <li><b>Identify each class’s <em>origin</em>.</b> This is the decisive step.
@@ -437,7 +437,7 @@ A report is just a cycle over those edges.</li>
 &amp;foo-&gt;bar:0               a named map (lock or explicit dept_map)  that lock/map's key
 &lt;sched&gt;:0                 a schedule()-based wait with NO map      static key at the WAIT callsite
 (unknown)(...)            event context start not recorded         n/a  (N/A stack)</pre>
-<code>&lt;sched&gt;</code> and “(unknown)” are the smell of a coarse class. Find the wait callsite from
+<code>&lt;sched&gt;</code> and "(unknown)" are the smell of a coarse class. Find the wait callsite from
 the <code>[W]</code> stack, open that function, and ask: <b>do semantically different wait channels
 pass through this exact line?</b> If yes, you have a key collision, the case fixed by
 <code><a class="commit" href="https://github.com/yskzalloc/linux-dept/commit/fd560f665f3e" title="rcu/update: fix same dept key collision between various types of RCU, DEPT branch dept19.1_v7.2, not in mainline">fd560f665f3e</a></code>.</li>
@@ -503,7 +503,7 @@ granularity. Used by the RCU fix.</td></tr>
 <tr><td><code>init_completion_dmap(x, m)</code></td><td>Attach an explicit map to a completion;
 otherwise the class is the <code>wait_for_completion*()</code> callsite.</td></tr>
 <tr><td><code>sdt_might_sleep_start[_timeout](m, t)</code> / <code>sdt_might_sleep_end()</code></td>
-<td>Marks a “might block in schedule()” region; with <code>m == NULL</code> the callsite key is used.</td></tr>
+<td>Marks a "might block in schedule()" region; with <code>m == NULL</code> the callsite key is used.</td></tr>
 <tr><td><code>sdt_wait(m)</code> / <code>sdt_event(m)</code> / <code>sdt_ecxt_enter/exit(m)</code></td>
 <td>Explicit wait/event annotation for custom primitives.</td></tr>
 <tr><td><code>CONFIG_DEPT_AGGRESSIVE_TIMEOUT_WAIT</code></td><td>Off by default: timeout waits are not
@@ -528,12 +528,12 @@ tracked, since they cannot deadlock forever.</td></tr>
   </li>
 
   <li>
-    <strong>DEPT v19.2 Github branch</strong>
+    <strong>DEPT v19.1 Github branch</strong>
     <ul>
       <li>
         <a hrief="https://github.com/yskzalloc/linux-dept"
            target="_blank" rel="noopener noreferrer">
-          DEPT v19.2 on v7.2 branch
+          DEPT v19.1 on v7.2 branch
         </a>
       </li>
     </ul>

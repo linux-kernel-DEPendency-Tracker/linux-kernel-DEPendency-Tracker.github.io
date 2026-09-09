@@ -92,7 +92,7 @@ Including the patches that actually landed and before/after diagrams for each.
 <h2 id="h2-1">1. Why lockdep is not enough</h2>
 
 <p>Lockdep validates <em>lock acquisition order</em>. It works because a lock is acquired and
-released by the same context, so “A then B” is a meaningful statement about one task.</p>
+released by the same context, so "A then B" is a meaningful statement about one task.</p>
 
 <p>Plenty of kernel blocking does not fit that shape. A folio lock is set by one context and
 cleared by another. A <code>wait_for_completion()</code> is satisfied by a kthread. A DMA fence is
@@ -101,14 +101,14 @@ deadlocks ship. Both case studies below are exactly that: <em>silent</em> deadlo
 structurally cannot see.</p>
 
 <p>DEPT (DEPendency Tracker, by Byungchul Park) changes the primitive being tracked, from
-“lock order” to “<b>wait</b> → <b>event</b>”. A lock becomes just one special case: “wait for
-the unlock event”. The documentation in this tree
+"lock order" to "<b>wait</b> → <b>event</b>". A lock becomes just one special case: "wait for
+the unlock event". The documentation in this tree
 (<code><a class="commit" href="https://github.com/yskzalloc/linux-dept/blob/dept19_v7.2/Documentation/dev-tools/dept.rst" title="Documentation/dev-tools/dept.rst">Documentation/dev-tools/dept.rst</a></code>) puts it as:</p>
 
 <div class="box">
-<p><i>“A deadlock occurs when one or more contexts are waiting for events that will never happen.
+<p><i>"A deadlock occurs when one or more contexts are waiting for events that will never happen.
 If an event occurrence to awaken its wait is a prerequisite to reaching another event, we call it
-<b>dependency</b>. A circular dependency of events leads to a deadlock.”</i></p>
+<b>dependency</b>. A circular dependency of events leads to a deadlock."</i></p>
 </div>
 
 <h2 id="h2-2">2. The DEPT model: wait, event, class</h2>
@@ -122,9 +122,9 @@ creates a dependency: the owed event cannot happen until the wait is satisfied.<
 flowchart TD
     S["Context"] --> W["Wait B"]
     W --> E["Event A"]
-    E -. "dependency: A cannot happen before B" .-> W
+    E -. "dependency: A cannot happen until B is resolved" .-> W
 </div>
-<p class="figcap">Read: “this context must see event B before it can produce event A”, i.e. edge
+<p class="figcap">Read: "this context must see event B before it can produce event A", i.e. edge
 <code>A → B</code>.</p>
 
 <h3>2.2 A dependency spans contexts</h3>
@@ -164,15 +164,15 @@ reports the moment a new edge closes a loop.</p>
 
 <pre class="diagram">A context that is inside an "event context" and blocks creates one graph edge:
 
-   ┌─────────────────────── context ──────────────────────────────────┐
-   │  [S] start owing event A   (e.g. mutex_lock → owes unlock)       │
-   │        ...                                                       │
-   │  [W] block waiting for event B   (e.g. folio_lock)               │
-   │        ...                                                       │
-   │  [E] event A would happen here but is unreachable                │
-   └──────────────────────────────────────────────────────────────────┘
+┌─────────────────────── context ──────────────────────────────┐
+│  [S] start owing event A   (e.g. mutex_lock → owes unlock)   │
+│        ...                                                   │
+│  [W] block waiting for event B   (e.g. folio_lock)           │
+│        ...                                                   │
+│  [E] event A would happen here but is unreachable            │
+└──────────────────────────────────────────────────────────────┘
 
-            edge: A depends on → B
+                   edge: A depends on → B
 
 Two such edges pointing at each other = cycle = deadlock report.</pre>
 
@@ -197,11 +197,11 @@ stacks behind each line.</p>
 <table>
 <tr><th>Symbol</th><th>Report text</th><th>How to read it</th></tr>
 <tr><td><span class="S">[S]</span></td><td>start of the event context</td>
-<td>“From here on, this context owes event X to someone.”</td></tr>
+<td>"From here on, this context owes event X to someone."</td></tr>
 <tr><td><span class="W">[W]</span></td><td>the wait blocked</td>
-<td>“And here it went to sleep waiting for Y.”</td></tr>
+<td>"And here it went to wait state(e.g., sleep) while waiting for Y."</td></tr>
 <tr><td><span class="E">[E]</span></td><td>the event not reachable</td>
-<td>“So X cannot happen while that sleep lasts.”</td></tr>
+<td>"So, X is impossible while the context is waiting for the event."</td></tr>
 </table>
 
 <p>Every report you will ever read has this shape, two contexts, each stuck before its own
@@ -242,7 +242,7 @@ event. If it is unreachable, everyone waiting on it is stuck.</li>
 <p>Notation: <code>lock(&amp;ni-&gt;ni_lock:0)</code> is <code>class(:subclass)</code>.
 <code>(unknown)</code> or an <code>(N/A)</code> stack means DEPT knows the class but not the code
 location, normal for the <em>event side</em> of things like folio locks and completions, where
-the producer is discovered dynamically. Do not treat <code>(N/A)</code> as “bug in DEPT”.</p>
+the producer is discovered dynamically. Do not treat <code>(N/A)</code> as "bug in DEPT".</p>
 
 <h2 id="h2-4">4. Turning it on</h2>
 
@@ -254,14 +254,14 @@ CONFIG_DEPT_UNIT_TEST=y                  # optional self-test of the tracker
 /proc/dept_stats                         # internal object usage / report counters
 /proc/dept_deps                          # every class-to-class edge recorded so far</pre>
 
-<p>Unlike lockdep, DEPT keeps going after the first report (“Multiple reports are allowed if
-there are more than a single problem”), which matters while the tracker is still shaking out
+<p>Unlike lockdep, DEPT keeps going after the first report ("Multiple reports are allowed if
+there are more than a single problem"), which matters while the tracker is still shaking out
 false positives.</p>
 
 <h2 id="h2-5">5. Case study (1) ntfs3: <code>ni_lock</code> vs. <code>PG_locked</code></h2>
 
-<p class="meta">syzbot <code><a class="ref" href="https://syzkaller.appspot.com/bug?extid=bed15dbf10294aa4f2ae" title="syzbot bug: INFO: task hung in do_user_addr_fault">bed15dbf10294aa4f2ae</a></code>, “INFO: task hung in
-do_user_addr_fault” · analysed by Linus Torvalds and Tetsuo Handa, Jan 2023 · reproduced by DEPT
+<p class="meta">syzbot <code><a class="ref" href="https://syzkaller.appspot.com/bug?extid=bed15dbf10294aa4f2ae" title="syzbot bug: INFO: task hung in do_user_addr_fault">bed15dbf10294aa4f2ae</a></code>, "INFO: task hung in
+do_user_addr_fault" · analysed by Linus Torvalds and Tetsuo Handa, Jan 2023 · reproduced by DEPT
 by Byungchul Park · fixed by commit <code><a class="commit" href="https://github.com/gregkh/linux/commit/0226635c304c" title="fs/ntfs3: don't hold ni_lock when calling truncate_setsize()">0226635c304c</a></code> (v6.2).</p>
 
 <h3>5.1 The bug</h3>
@@ -344,13 +344,13 @@ context B
 ⇒ <code>PG_locked → ni_lock</code>.</li>
 </ul>
 
-<p>This is the report that <code><a class="commit" href="https://github.com/yskzalloc/linux-dept/blob/dept19_v7.2/Documentation/dev-tools/dept.rst" title="Documentation/dev-tools/dept.rst">Documentation/dev-tools/dept.rst</a></code> now uses as its worked
+<p>This is the report that <code><a class="commit" href="https://github.com/yskzalloc/linux-dept/blob/dept19.1_v7.2/Documentation/dev-tools/dept.rst" title="Documentation/dev-tools/dept.rst">Documentation/dev-tools/dept.rst</a></code> now uses as its worked
 example, and it is a genuine, reproducible deadlock, a good first report to study precisely
 because it is <em>true</em>.</p>
 
 <h3>5.3 The fix that landed</h3>
 
-<p class="meta"><code><a class="commit" href="https://github.com/gregkh/linux/commit/0226635c304c" title="fs/ntfs3: don't hold ni_lock when calling truncate_setsize()">0226635c304c</a></code> “fs/ntfs3: don't hold ni_lock when calling truncate_setsize()" Tetsuo Handa, co-developed with Hillf Danton, debugged by Linus,
+<p class="meta"><code><a class="commit" href="https://github.com/gregkh/linux/commit/0226635c304c" title="fs/ntfs3: don't hold ni_lock when calling truncate_setsize()">0226635c304c</a></code> "fs/ntfs3: don't hold ni_lock when calling truncate_setsize()" Tetsuo Handa, co-developed with Hillf Danton, debugged by Linus,
 applied directly by Linus for v6.2. Two lines moved, no new locking.</p>
 
 <pre>--- a/fs/ntfs3/file.c
@@ -424,11 +424,11 @@ lock while holding <code>ni_lock</code>. No cycle can be closed.</p>
 (<code>dept: track PG_locked with dept</code>). See <code>include/linux/pagemap.h</code>:
 <code>dept_page_set_bit(&amp;folio-&gt;page, PG_locked)</code> on the acquire side and
 <code>dept_page_wait_on_bit(&amp;folio-&gt;page, PG_locked)</code> in <code>folio_lock()</code> /
-<code>folio_wait_locked()</code>. A side branch of this repo
-(<code>b4/dept19.1_v7.2/rdtm</code>) additionally carries “lkdtm: Add folio_lock deadlock
-scenarios”, which turns this exact pattern into an on-demand test; it is not on the
-<code>dept19.1_v7.2</code> branch itself.</p>
+<code>folio_wait_locked()</code>. Additionally, The patch <code><a class="commit" href="https://lore.kernel.org/all/20260516235356.635435-3-yunseong.kim@est.tech/" title="lkdtm: Add folio_lock deadlock scenarios">"lkdtm: Add folio_lock deadlock scenarios"</a></code>, which turns this exact pattern into an on-demand test; it is not on the
+<code><a class="commit" href="https://github.com/yskzalloc/linux-dept/blob/dept19.1_v7.2" title="dept19.1_v7.2 branch">dept19.1_v7.2</a></code> branch itself.</p>
 </div>
+
+https://lore.kernel.org/all/20260516235356.635435-3-yunseong.kim@est.tech/
 
 <h2 id="h2-6">6. Case study (2) hugetlb: folio lock vs. <code>hugetlb_fault_mutex_table</code></h2>
 
@@ -503,8 +503,8 @@ path, so a wait that came in through the fast path was never staged. The debug p
 <code>dept_page_wait_on_bit(&amp;folio-&gt;page, PG_locked)</code> directly in
 <code>folio_lock()</code> which is what the current tree does permanently.</li>
 <li><b>Report de-duplication hid it.</b> Removing <code>tc-&gt;reported = true</code> in
-<code>print_circle()</code> let the tracker keep reporting. His own words: <i>“Some of my efforts
-to suppress false positives, suppressed the real one.”</i></li>
+<code>print_circle()</code> let the tracker keep reporting. His own words: <i>"Some of my efforts
+to suppress false positives, suppressed the real one."</i></li>
 </ol>
 
 <p>With those in place, Gavin re-ran the reproducer and DEPT printed the cycle in the first
@@ -522,24 +522,24 @@ context B                                          &lt;- the process that holds 
    <span class="W">[W]</span> dept_page_wait_on_bit(pg_locked_map:0)      hugetlb_fault+0x817   (folio_lock)
    <span class="E">[E]</span> unlock(&amp;hugetlb_fault_mutex_table[i]:0)     (N/A)</pre>
 
-<p>Same two-edge structure as the ntfs3 case, with the roles of “lock” and “page flag” swapped:
+<p>Same two-edge structure as the ntfs3 case, with the roles of "lock" and "page flag" swapped:
 <code>PG_locked → fault_mutex</code> from A, <code>fault_mutex → PG_locked</code> from B.</p>
 
 <h3>6.3 The fix that landed</h3>
 
 <p>Gavin’s first patch was the minimal one: drop and re-acquire the pagecache folio lock around
-the unmap window. Andrew queued it but called it out, <i>“The fix looks a bit nasty… a more
-broadly architected solution may be needed going forward.”</i> That is what happened: the code in
+the unmap window. Andrew queued it but called it out, <i>"The fix looks a bit nasty… a more
+broadly architected solution may be needed going forward."</i> That is what happened: the code in
 this tree carries Oscar Salvador’s rework instead, and no commit in this repository ever adds a
 <code>folio_unlock(pagecache_folio)</code> to the unmap window.</p>
 
-<p class="meta"><code><a class="commit" href="https://github.com/gregkh/linux/commit/2ae1ab9934c7" title="mm,hugetlb: change mechanism to detect a COW on private mapping">2ae1ab9934c7</a></code> “mm,hugetlb: change mechanism to detect a COW on private
-mapping” (v6.17) <code>Reported-by: Gavin Guo</code>,
+<p class="meta"><code><a class="commit" href="https://github.com/gregkh/linux/commit/2ae1ab9934c7" title="mm,hugetlb: change mechanism to detect a COW on private mapping">2ae1ab9934c7</a></code> "mm,hugetlb: change mechanism to detect a COW on private
+mapping" (v6.17) <code>Reported-by: Gavin Guo</code>,
 <code>Fixes: <a class="commit" href="https://github.com/gregkh/linux/commit/40549ba8f8e0" title="hugetlb: use new vma_lock for pmd sharing synchronization">40549ba8f8e0</a></code>, <code>Suggested-by: Peter Xu</code>. 34 insertions, 54 deletions.</p>
 
 <p>The insight is that the folio lock was never needed for the actual question being asked.
 <code>hugetlb_wp()</code> looked up and locked the pagecache folio only to compare it with the
-mapped folio, in order to learn “was the reservation for this address already consumed?”. That is
+mapped folio, in order to learn "was the reservation for this address already consumed?". That is
 answerable locally:</p>
 
 <pre>-	if (is_vma_resv_set(vma, HPAGE_RESV_OWNER) &amp;&amp;
@@ -610,7 +610,7 @@ flowchart LR
 folio lock, but no one holds a folio lock across a wait for the mutex, the reverse edge is gone
 together with the <code>pagecache_folio</code> lookup.</p>
 
-<p>Follow-ups in the same series tighten it further(<code><a class="commit" href="https://github.com/gregkh/linux/commit/9293fb476552" title="mm,hugetlb: sort out folio locking in the faulting path">9293fb476552</a></code> “mm,hugetlb: sort out folio locking in the faulting path”, plus
+<p>Follow-ups in the same series tighten it further(<code><a class="commit" href="https://github.com/gregkh/linux/commit/9293fb476552" title="mm,hugetlb: sort out folio locking in the faulting path">9293fb476552</a></code> "mm,hugetlb: sort out folio locking in the faulting path", plus
 cleanups). In this tree’s <code>mm/hugetlb.c</code> the signature is now
 <code>static vm_fault_t hugetlb_wp(struct vm_fault *vmf)</code> and <code>pagecache_folio</code>
 does not exist.</p>
@@ -632,8 +632,8 @@ does not exist.</p>
 <div class="box">
 <h4>The repeating pattern</h4>
 <p>Both fixes delete one direction of a two-edge cycle, and neither adds a lock. When you get a
-DEPT report, the useful question is not “which lock should I add or reorder?” but <b>“which of
-these two dependencies is unnecessary?”</b>, usually it is the one where a long, blocking
+DEPT report, the useful question is not "which lock should I add or reorder?" but <b>"which of
+these two dependencies is unnecessary?"</b>, usually it is the one where a long, blocking
 operation was left inside a lock (ntfs3), or where a lock was held only to answer a question that
 could be answered without it (hugetlb).</p>
 </div>
@@ -666,8 +666,9 @@ subsystems are the signature of an over-merged class.</li>
 <code>init_completion_dmap()</code>), or separate instances with a subclass
 (<code>dept_map_init(m, k, sub_u, n)</code>).</li>
 <li>Re-verify that real deadlocks are still detected (<code>CONFIG_DEPT_UNIT_TEST</code>, plus the
-<code>lkdtm</code> folio-lock scenarios if you pull in the <code>b4/…/rdtm</code> branch),
-silencing noise by disabling detection is the trap the hugetlb case fell into.</li>
+<code>lkdtm</code> folio-lock scenarios if you check in the
+<code><a class="commit" href="https://lore.kernel.org/all/20260516235356.635435-3-yunseong.kim@est.tech/" title="lkdtm: Add folio_lock deadlock scenarios">"lkdtm: Add folio_lock deadlock scenarios"
+</a></code> patch), silencing noise by disabling detection is the trap the hugetlb case fell into.</li>
 </ol>
 
 <p>A fully worked example of exactly this, an RCU report where
@@ -692,12 +693,12 @@ silencing noise by disabling detection is the trap the hugetlb case fell into.</
   </li>
 
   <li>
-    <strong>DEPT v19.2 Github branch</strong>
+    <strong>DEPT v19.1 Github branch</strong>
     <ul>
       <li>
         <a hrief="https://github.com/yskzalloc/linux-dept"
            target="_blank" rel="noopener noreferrer">
-          DEPT v19.2 on v7.2 branch
+          DEPT v19.1 on v7.2 branch
         </a>
       </li>
     </ul>
