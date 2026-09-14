@@ -65,7 +65,14 @@
   .figcap{color:var(--dim);font-size:.84rem;margin:0 0 22px;text-align:center}
   .mermaid:not([data-processed])::before{content:"diagram";
            color:var(--dim);font-size:.8rem}
-</style>
+  g.actor[data-id="NI"] > circle, g.actor[data-id="NI"] > line,
+  g.actor[data-id="FL"] > circle, g.actor[data-id="FL"] > line,
+  g.actor[data-id="M"] > circle, g.actor[data-id="M"] > line,
+  g.actor[data-id="F"] > circle, g.actor[data-id="F"] > line {stroke: #86c99a !important; stroke-width: 4px !important;}
+  line.actor-line[name="NI"], line.actor-line[name="FL"], line.actor-line[name="M"], line.actor-line[name="F"]
+  {stroke: #86c99a !important; stroke-width: 2px !important;}
+ 
+ </style>
 </head>
 <body>
 <div class="wrap">
@@ -246,10 +253,11 @@ the producer is discovered dynamically. Do not treat <code>(N/A)</code> as "bug 
 
 <h2 id="h2-4">4. Turning it on</h2>
 
-<pre>CONFIG_DEPT=y                            # lib/Kconfig.debug: "Dependency tracking (EXPERIMENTAL)"
+<pre>
+CONFIG_DEPT=y                            # lib/Kconfig.debug: "Dependency tracking (EXPERIMENTAL)"
                                          # selects PROVE_LOCKING, STACKTRACE, KALLSYMS_ALL, ...
 CONFIG_DEPT_AGGRESSIVE_TIMEOUT_WAIT=n    # default: ignore waits that have a timeout
-CONFIG_DEPT_UNIT_TEST=y                  # optional self-test of the tracker
+CONFIG_DEPT_UNIT_TEST=m                  # optional self-test of the tracker
 
 /proc/dept_stats                         # internal object usage / report counters
 /proc/dept_deps                          # every class-to-class edge recorded so far</pre>
@@ -269,26 +277,27 @@ by Byungchul Park · fixed by commit <code><a class="commit" href="https://githu
 <p>Two threads, one file. Nobody violates a lock order, because only one of the two blocking
 objects is a lock.</p>
 
-<pre class="diagram">thread 1: truncate (creat(2) -&gt; do_truncate)      thread 2: read/write via page cache
---------------------------------------------      ---------------------------------------
+<pre class="diagram">
+Context A: truncate (creat(2) → do_truncate)                    Context B: read/write via page cache
+--------------------------------------------                    ------------------------------------
 ntfs3_setattr
   ntfs_truncate
-    <b>ni_lock(ni)</b>                        [S]
-                                                  filemap_read
-                                                    filemap_get_pages
-                                                      filemap_update_page
-                                                        folio_trylock()  -&gt; <b>sets PG_locked</b>  [S]
-                                                        filemap_read_folio
-                                                          mpage_read_folio
-                                                            do_mpage_readpage
-                                                              ntfs_get_block_vbo
-                                                                attr_data_get_block
-                                                                  <b>ni_lock(ni)</b>  -&gt; blocks   [W]
+    <b>ni_lock(ni)</b>  [S]
+                                                                filemap_read
+                                                                  filemap_get_pages
+                                                                    filemap_update_page
+                                                                      folio_trylock()  → <b>sets PG_locked</b>  [S]
+                                                                      filemap_read_folio
+                                                                        mpage_read_folio
+                                                                          do_mpage_readpage
+                                                                            ntfs_get_block_vbo
+                                                                              attr_data_get_block
+                                                                                <b>ni_lock(ni)</b>  → blocks   [W]
     truncate_setsize
       truncate_pagecache
         truncate_inode_pages_range
-          <b>folio_lock()</b> -&gt; waits PG_locked  [W]
-                                    &lt;- deadlock: each holds what the other waits for</pre>
+          <b>folio_lock()</b> → waits PG_locked  [W]
+                                    ← deadlock: each holds what the other waits for</pre>
 
 <p>Lockdep sees only <code>ni_lock</code>; the other half of the cycle is a page flag with no
 lockdep annotation. Tetsuo’s summary in the thread: <i>"Since no lockdep annotation is used for
@@ -297,19 +306,21 @@ e.g. PG_locked bit, this deadlock cannot be detected by lockdep..."</i></p>
 <div class="mermaid">
 sequenceDiagram
     autonumber
-    participant A as Context A truncate
-    participant NI as ni_lock
-    participant FL as folio / PG_locked
-    participant B as Context B page-cache read
+    participant A as Context A: truncate
+    participant NI@{ "type": "entity", "alias": "ni_lock" }
+    participant FL@{ "type": "entity", "alias": "folio / PG_locked" }
+    participant B as Context B: page-cache read
 
     A->>NI: [S] ni_lock(ni) taken in ntfs_truncate
     B->>FL: [S] folio_trylock() sets PG_locked in filemap_update_page
     B->>NI: [W] ni_lock(ni) in attr_data_get_block BLOCKS
     Note over NI,B: B sleeps until A's [E] ni_unlock
+    B-->>FL: [E] folio_unlock unreachable
     A->>FL: [W] folio_lock() in truncate_inode_pages_range BLOCKS
     Note over A,FL: A sleeps until B's [E] folio_unlock
+    A-->>NI: [E] ni_unlock unreachable
     rect rgb(74, 27, 30)
-    Note over A,B: DEADLOCK A's [E] ni_unlock and B's [E] folio_unlock are both unreachable
+    Note over A,B: ***DEADLOCK*** Context A's [E] ni_unlock and B's [E] folio_unlock are both unreachable
     end
 </div>
 <p class="dlbanner">*** DEADLOCK *** &nbsp;A holds ni_lock and waits for the folio &nbsp;·&nbsp;
@@ -326,13 +337,13 @@ blocked at <code>[W] lock(ni_lock)</code>.</p>
 
 <pre><span class="dl">*** DEADLOCK ***</span>
 
-context A
+context A: truncate
     <span class="S">[S]</span> lock(&amp;ni-&gt;ni_lock:0)                        ntfs3_setattr+0x54b
     <span class="W">[W]</span> folio_wait_bit_common(PG_locked_map:0)      truncate_inode_pages_range+0x9b0
     <span class="E">[E]</span> unlock(&amp;ni-&gt;ni_lock:0)                      (N/A)
 
-context B
-    <span class="S">[S]</span> (unknown)(PG_locked_map:0)                  (N/A)   &lt;- folio_trylock(), no stack kept
+context B: page-cache read
+    <span class="S">[S]</span> (unknown)(PG_locked_map:0)                  (N/A)   ← folio_trylock(), no stack kept
     <span class="W">[W]</span> lock(&amp;ni-&gt;ni_lock:0)                        attr_data_get_block+0x32c
     <span class="E">[E]</span> folio_unlock(PG_locked_map:0)               generic_write_end+0xf2</pre>
 
@@ -428,8 +439,6 @@ lock while holding <code>ni_lock</code>. No cycle can be closed.</p>
 <code><a class="commit" href="https://github.com/yskzalloc/linux-dept/blob/dept19.1_v7.2" title="dept19.1_v7.2 branch">dept19.1_v7.2</a></code> branch itself.</p>
 </div>
 
-https://lore.kernel.org/all/20260516235356.635435-3-yunseong.kim@est.tech/
-
 <h2 id="h2-6">6. Case study (2) hugetlb: folio lock vs. <code>hugetlb_fault_mutex_table</code></h2>
 
 <p class="meta">Reported by Gavin Guo (Igalia), May 2025, found with an internal syzkaller
@@ -439,24 +448,25 @@ whether DEPT would have caught it; after one extra annotation it did. Fixed upst
 
 <h3>6.1 The bug, a true ABBA, but one side is a folio lock</h3>
 
-<pre class="diagram">Lock A = the pagecache folio lock        Lock B = hugetlb_fault_mutex_table[hash]
+<pre class="diagram">
 
-Process 1                                Process 2
----------                                ---------
+Context A: hugetlb_wp                                           Context B: filemap_lock_hugetlb_folio
+---------------------                                           -------------------------------------
 hugetlb_fault
-  mutex_lock(B)                    [S]
+  mutex_lock(B)
   filemap_lock_hugetlb_folio
-    folio_lock(A)                  [S]
+    filemap_lock_folio
+      folio_lock(A)                  [S]
   hugetlb_wp
-    mutex_unlock(B)      &lt;- B released, A still held
-    ...                                  hugetlb_fault
-                                           mutex_lock(B)              [S] (gets it)
-                                           filemap_lock_hugetlb_folio
-                                             folio_lock(A)  -&gt; blocks [W]
+    mutex_unlock(B)      ← B released, A still held
+    ...                                                         hugetlb_fault
+                                                                  mutex_lock(B)              [S] (gets it)
+                                                                  filemap_lock_hugetlb_folio
+                                                                    filemap_lock_folio
+                                                                      folio_lock(A)  → blocks [W]
     unmap_ref_private
     ...
-    mutex_lock(B)  -&gt; blocks       [W]
-                                    &lt;- P1 waits B (held by P2), P2 waits A (held by P1)</pre>
+    mutex_lock(B)  -&gt; blocks       [W]  ← Context A waits B (held by Context B), Context B waits A (held by Context A)</pre>
 
 <p>The window is opened deliberately: <code>hugetlb_wp()</code> must drop the fault mutex and the
 VMA lock before <code>unmap_ref_private()</code>, but it keeps the pagecache folio locked across
@@ -465,32 +475,33 @@ that window. Lockdep cannot help, since A is a folio lock.</p>
 <div class="mermaid">
 sequenceDiagram
     autonumber
-    participant P1 as Process 1
-    participant M as hugetlb_fault_mutex
-    participant F as pagecache folio lock
-    participant P2 as Process 2
+    participant CA as Context A: hugetlb_wp
+    participant F@{ "type": "entity", "alias": "pagecache folio lock" }
+    participant M@{ "type": "entity", "alias": "mutex_table[hash]" }
+    participant CB as Context B: filemap_lock_hugetlb_folio
 
-    P1->>M: [S] mutex_lock(B) taken in hugetlb_fault
-    P1->>F: [S] folio_lock(A) taken in filemap_lock_hugetlb_folio
-    P1-->>M: mutex_unlock(B) in hugetlb_wp, window opens, folio A still held
-    P2->>M: [S] mutex_lock(B) taken, the mutex is free now
-    P2->>F: [W] folio_lock(A) BLOCKS
-    Note over F,P2: P2 sleeps until P1's [E] folio_unlock
-    P1->>M: [W] mutex_lock(B) after unmap_ref_private BLOCKS
-    Note over P1,M: P1 sleeps until P2's [E] mutex_unlock
+    CA->>F: [S] folio_lock(A) taken in filemap_lock_hugetlb_folio
+    CB->>M: [S] mutex_lock(B) taken
+    CB->>F: [W] folio_lock(A) BLOCKS
+    Note over F,CB: Context B sleeps until Context A's [E] folio_unlock
+    CB-->>M: [E] mutex_unlock unreachable
+    CA->>M: [W] mutex_lock(B) after unmap_ref_private BLOCKS
+    Note over CA,M: Context A sleeps until Context B's [E] mutex_unlock
+    CA-->>F: [E] folio_unlock unreachable
     rect rgb(74, 27, 30)
-    Note over P1,P2: DEADLOCK P1 holds A and wants B, P2 holds B and wants A
+    Note over CA, CB: ***DEADLOCK*** Contex A's [E] mutex_unlock and B's [E] folio_unlock are both unreachable
     end
 </div>
-<p class="dlbanner">*** DEADLOCK *** &nbsp;P1 holds folio A and waits for mutex B &nbsp;·&nbsp;
-P2 holds mutex B and waits for folio A</p>
-<p class="figcap">Real runtime order. Step 3 is what makes this reachable: P1 hands the mutex away
-but keeps the folio locked, so P2 can complete steps 4–5 before P1 arrives at step 7. Dependency
+
+<p class="dlbanner">*** DEADLOCK *** &nbsp;Context A holds folio A and waits for mutex B &nbsp;·&nbsp;
+Context B holds mutex B and waits for folio A</p>
+<p class="figcap">Real runtime order. Step 1 is what makes this reachable: Context A hands the mutex away
+but keeps the folio locked, so Context B can complete steps 2–3 before Context A arrives at step 4. Dependency
 cycle: <code>folio lock → fault mutex → folio lock</code>.</p>
 
-<p>P1 cannot reach <code>[E] folio_unlock</code> because it is blocked at
+<p>Context A cannot reach <code>[E] folio_unlock</code> because it is blocked at
 <code>[W] lock(fault_mutex)</code> (the re-take after <code>unmap_ref_private()</code>);
-P2 cannot reach <code>[E] unlock(fault_mutex)</code> because it is blocked at
+Context B cannot reach <code>[E] unlock(fault_mutex)</code> because it is blocked at
 <code>[W] folio_lock</code>. Same shape as the ntfs3 cycle, with the two roles swapped.</p>
 
 <h3>6.2 Making DEPT see it</h3>
@@ -502,22 +513,19 @@ are instructive for beginners:</p>
 path, so a wait that came in through the fast path was never staged. The debug patch added
 <code>dept_page_wait_on_bit(&amp;folio-&gt;page, PG_locked)</code> directly in
 <code>folio_lock()</code> which is what the current tree does permanently.</li>
-<li><b>Report de-duplication hid it.</b> Removing <code>tc-&gt;reported = true</code> in
-<code>print_circle()</code> let the tracker keep reporting. His own words: <i>"Some of my efforts
-to suppress false positives, suppressed the real one."</i></li>
-</ol>
-
-<p>With those in place, Gavin re-ran the reproducer and DEPT printed the cycle in the first
+<li><b>Report de-duplication hid it.</b> Removing <code>tc-&gt;reported = true</code> keep reporting. His own words: </li>"Some of my efforts
+to suppress false positives, suppressed the real one."
+</ol>With those in place, Gavin re-ran the reproducer and DEPT printed the cycle in the first
 round:</p>
 
-<pre><span class="dl">*** DEADLOCK ***</span>
+<pre><span class="dl">** DEADLOCK ***</span>
 
-context A                                          &lt;- the process that holds the folio lock
+context A: hugetlb_wp                               ← the process that holds the folio lock
    <span class="S">[S]</span> (unknown)(pg_locked_map:0)                  (N/A)
    <span class="W">[W]</span> lock(&amp;hugetlb_fault_mutex_table[i]:0)       hugetlb_wp+0xfa4      (re-take after unmap)
    <span class="E">[E]</span> dept_page_clear_bit(pg_locked_map:0)        hugetlb_fault+0x1ccb  (folio_unlock)
 
-context B                                          &lt;- the process that holds the mutex
+context B: filemap_lock_hugetlb_folio               ← the process that holds the mutex
    <span class="S">[S]</span> lock(&amp;hugetlb_fault_mutex_table[i]:0)       hugetlb_fault+0x3c6
    <span class="W">[W]</span> dept_page_wait_on_bit(pg_locked_map:0)      hugetlb_fault+0x817   (folio_lock)
    <span class="E">[E]</span> unlock(&amp;hugetlb_fault_mutex_table[i]:0)     (N/A)</pre>
@@ -568,10 +576,10 @@ is documented explicitly:</p>
 <pre class="diagram">hugetlb_fault:
   mutex_lock(B)                       [S]
   pagecache_folio = filemap_lock_
-        hugetlb_folio(...)   -&gt; A     [S]
+        hugetlb_folio(...)   → A     [S]
   folio_trylock(mapped folio)
   hugetlb_wp(pagecache_folio, vmf)
-    mutex_unlock(B)   &lt;-- window opens
+    mutex_unlock(B)   ⇐ window opens
     unmap_ref_private()   (A still held)
     mutex_lock(B)                     [W]
 
@@ -587,7 +595,7 @@ is documented explicitly:</p>
   /* no pagecache lookup, no lock A */
   if (write &amp;&amp; !writable) {
       folio = mapped folio
-      if (!folio_trylock(folio))      -&gt; bail,
+      if (!folio_trylock(folio))      → bail,
              need_wait_lock = true       retry
       hugetlb_wp(vmf)
           /* uses folio_test_anon() */
@@ -595,10 +603,10 @@ is documented explicitly:</p>
   }
   mutex_unlock(B)
   if (need_wait_lock)
-      folio_wait_locked(folio)  &lt;- OUTSIDE the mutex
+      folio_wait_locked(folio)  ← OUTSIDE the mutex
 
    fault_mutex(B) ──&gt; PG_locked(A)   only
-   no reverse edge  =&gt;  no cycle</pre>
+   no reverse edge  →  no cycle</pre>
 </div>
 </div>
 
@@ -734,7 +742,7 @@ subsystems are the signature of an over-merged class.</li>
       <li>
         <a href="https://lore.kernel.org/all/b6e00e77-4a8c-4e05-ab79-266bf05fcc2d@igalia.com/"
            target="_blank" rel="noopener noreferrer">
-          Gavin Guo (Igalia) LKML discussion
+          Gavin Guo (Igalia)'s LKML discussion
         </a>
       </li>
     </ul>
